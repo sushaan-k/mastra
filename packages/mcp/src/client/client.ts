@@ -495,11 +495,30 @@ export class InternalMastraMCPClient extends MastraBase {
 
         resolve(true);
 
-        // Set up disconnect handler to reset state.
+        // Set up disconnect handler to reset state. Close the previous transport
+        // here so we don't leak its EventSource / fetch stream when the next
+        // connect() runs, matching what forceReconnect() does on the explicit path.
+        // Also run the process-hook cleanup that disconnect() would have done, so
+        // a server-side close doesn't leave exit hooks and signal listeners behind.
         const originalOnClose = this.client.onclose;
         this.client.onclose = () => {
+          const previousTransport = this.transport;
+          // Re-entry guard: transport.close() below synchronously fires
+          // transport.onclose, which the SDK forwards back here. By the time
+          // we re-enter, this.transport is already cleared, so just bail out
+          // and don't double-fire originalOnClose.
+          if (!previousTransport) {
+            return;
+          }
           this.log('debug', `MCP server connection closed`);
+          this.transport = undefined;
           this.isConnected = null;
+          this.releaseProcessHooks();
+          void Promise.resolve(previousTransport.close()).catch(e => {
+            this.log('debug', 'Error closing previous transport (ignored)', {
+              error: e instanceof Error ? e.message : String(e),
+            });
+          });
           if (typeof originalOnClose === 'function') {
             originalOnClose();
           }
@@ -565,9 +584,31 @@ export class InternalMastraMCPClient extends MastraBase {
     return null;
   }
 
+  /**
+   * Unregister the exit hook and SIGTERM/SIGHUP handlers that `connect()` installs.
+   * Idempotent: each handle is only released if currently held.
+   */
+  private releaseProcessHooks(): void {
+    if (this.exitHookUnsubscribe) {
+      this.exitHookUnsubscribe();
+      this.exitHookUnsubscribe = undefined;
+    }
+    if (this.sigTermHandler) {
+      process.off('SIGTERM', this.sigTermHandler);
+      this.sigTermHandler = undefined;
+    }
+    if (this.sigHupHandler) {
+      process.off('SIGHUP', this.sigHupHandler);
+      this.sigHupHandler = undefined;
+    }
+  }
+
   async disconnect() {
     if (!this.transport) {
       this.log('debug', 'Disconnect called but no transport was connected.');
+      // The transport may have already been cleared by an onclose-triggered
+      // teardown; release any lingering process hooks defensively.
+      this.releaseProcessHooks();
       return;
     }
     this.log('debug', `Disconnecting from MCP server`);
@@ -582,20 +623,7 @@ export class InternalMastraMCPClient extends MastraBase {
     } finally {
       this.transport = undefined;
       this.isConnected = null;
-
-      // Clean up exit hooks to prevent memory leaks
-      if (this.exitHookUnsubscribe) {
-        this.exitHookUnsubscribe();
-        this.exitHookUnsubscribe = undefined;
-      }
-      if (this.sigTermHandler) {
-        process.off('SIGTERM', this.sigTermHandler);
-        this.sigTermHandler = undefined;
-      }
-      if (this.sigHupHandler) {
-        process.off('SIGHUP', this.sigHupHandler);
-        this.sigHupHandler = undefined;
-      }
+      this.releaseProcessHooks();
     }
   }
 

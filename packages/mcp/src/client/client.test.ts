@@ -3022,3 +3022,117 @@ describe('MastraMCPClient - custom fetch failure modes (auth-token loop)', () =>
     tokenWaiters.forEach(cancel => cancel());
   }, 20000);
 });
+
+describe('MastraMCPClient - onclose transport cleanup', () => {
+  let testServer: {
+    httpServer: HttpServer;
+    mcpServer: McpServer;
+    serverTransport: StreamableHTTPServerTransport;
+    baseUrl: URL;
+  };
+
+  beforeEach(async () => {
+    testServer = await setupTestServer(true);
+  });
+
+  afterEach(async () => {
+    await testServer?.mcpServer.close().catch(() => {});
+    await testServer?.serverTransport?.close().catch(() => {});
+    testServer?.httpServer.close();
+  });
+
+  it('closes the previous transport on server-triggered close', async () => {
+    const client = new InternalMastraMCPClient({
+      name: 'onclose-cleanup',
+      server: { url: testServer.baseUrl },
+    });
+    await client.connect();
+
+    // @ts-expect-error internal
+    const transport = client.transport as { close: () => Promise<void> } | undefined;
+    expect(transport).toBeDefined();
+    const closeSpy = vi.spyOn(transport!, 'close');
+
+    // @ts-expect-error internal
+    const sdkClient = client.client as Client;
+    sdkClient.onclose!();
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+    // @ts-expect-error internal
+    expect(client.transport).toBeUndefined();
+    // @ts-expect-error internal
+    expect(client.isConnected).toBeNull();
+
+    await client.disconnect().catch(() => {});
+  });
+
+  it('swallows errors from the previous transport close', async () => {
+    const client = new InternalMastraMCPClient({
+      name: 'onclose-error-swallow',
+      server: { url: testServer.baseUrl },
+    });
+    await client.connect();
+
+    // @ts-expect-error internal
+    const transport = client.transport as { close: () => Promise<void> } | undefined;
+    vi.spyOn(transport!, 'close').mockRejectedValueOnce(new Error('boom'));
+
+    // @ts-expect-error internal
+    const sdkClient = client.client as Client;
+    expect(() => sdkClient.onclose!()).not.toThrow();
+    await new Promise(resolve => setImmediate(resolve));
+
+    // @ts-expect-error internal
+    expect(client.transport).toBeUndefined();
+    await client.disconnect().catch(() => {});
+  });
+
+  it('only closes once even if onclose fires multiple times', async () => {
+    const client = new InternalMastraMCPClient({
+      name: 'onclose-idempotent',
+      server: { url: testServer.baseUrl },
+    });
+    await client.connect();
+
+    // @ts-expect-error internal
+    const transport = client.transport as { close: () => Promise<void> } | undefined;
+    const closeSpy = vi.spyOn(transport!, 'close');
+
+    // @ts-expect-error internal
+    const sdkClient = client.client as Client;
+    sdkClient.onclose!();
+    sdkClient.onclose!();
+    sdkClient.onclose!();
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+    await client.disconnect().catch(() => {});
+  });
+
+  it('releases the exit hook and signal listeners on server-side close', async () => {
+    const initialSigterm = process.listenerCount('SIGTERM');
+    const initialSighup = process.listenerCount('SIGHUP');
+
+    const client = new InternalMastraMCPClient({
+      name: 'onclose-process-hooks',
+      server: { url: testServer.baseUrl },
+    });
+    await client.connect();
+
+    // Connecting installs one SIGTERM + one SIGHUP handler plus an exit hook.
+    expect(process.listenerCount('SIGTERM')).toBe(initialSigterm + 1);
+    expect(process.listenerCount('SIGHUP')).toBe(initialSighup + 1);
+
+    // @ts-expect-error internal
+    const sdkClient = client.client as Client;
+    sdkClient.onclose!();
+    await new Promise(resolve => setImmediate(resolve));
+
+    // After the implicit teardown the process listeners should be back to baseline.
+    expect(process.listenerCount('SIGTERM')).toBe(initialSigterm);
+    expect(process.listenerCount('SIGHUP')).toBe(initialSighup);
+
+    await client.disconnect().catch(() => {});
+  });
+});
