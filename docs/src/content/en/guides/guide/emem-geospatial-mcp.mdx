@@ -1,0 +1,145 @@
+---
+title: "Guide: Geospatial verification with emem"
+description: "Connect a Mastra agent to the emem MCP server to answer place-based questions with signed, verifiable facts."
+---
+
+import Steps from "@site/src/components/Steps";
+import StepItem from "@site/src/components/StepItem";
+
+# Geospatial verification with emem
+
+[emem](https://emem.dev) is a remote MCP server for geospatial verification. It exposes layers like elevation, land cover, surface water, and administrative boundaries, and returns each fact with a content-addressed `fact_cid` receipt so an agent can cite the evidence behind its answer.
+
+This guide connects a Mastra agent to emem over MCP and asks a verification question about a real place.
+
+## Prerequisites
+
+- Node.js `v22.13.0` or later installed
+- An API key from a supported [Model Provider](/models)
+- An existing Mastra project (Follow the [installation guide](/guides/getting-started/quickstart) to set up a new project)
+
+emem reads are anonymous, so no emem API key is required.
+
+## Installation
+
+Install the MCP client package:
+
+```bash npm2yarn
+npm install @mastra/mcp@latest
+```
+
+## Configure environment variables
+
+Create a `.env` file in your project root:
+
+```bash title=".env"
+OPENAI_API_KEY=sk-your-api-key
+# Optional; defaults to https://emem.dev/mcp
+EMEM_MCP_URL=https://emem.dev/mcp
+```
+
+## Connect Mastra to emem
+
+emem is served over HTTP, so `MCPClient` connects with a `url` and discovers the available tools dynamically (`locate`, `recall`, `compare`, `verify`, and others).
+
+<Steps>
+  <StepItem>
+    Create `src/mastra/mcp/emem-client.ts`:
+
+    ```ts title="src/mastra/mcp/emem-client.ts"
+    import { MCPClient } from '@mastra/mcp'
+
+    const EMEM_MCP_URL = process.env.EMEM_MCP_URL ?? 'https://emem.dev/mcp'
+
+    export const ememMcpClient = new MCPClient({
+      id: 'emem-mcp-client',
+      servers: {
+        emem: {
+          url: new URL(EMEM_MCP_URL),
+        },
+      },
+    })
+    ```
+
+    `MCPClient` first tries the Streamable HTTP transport and falls back to the legacy HTTP+SSE transport if the server only speaks SSE.
+  </StepItem>
+
+  <StepItem>
+    Create the agent at `src/mastra/agents/emem-agent.ts`:
+
+    ```ts title="src/mastra/agents/emem-agent.ts"
+    import { Agent } from '@mastra/core/agent'
+    import { ememMcpClient } from '../mcp/emem-client'
+
+    export const ememAgent = new Agent({
+      id: 'emem-agent',
+      name: 'emem Geospatial Agent',
+      description: 'Answers place-based questions with signed evidence from emem.',
+      instructions: `
+        You are a geospatial verification assistant.
+
+        Use the emem MCP tools to gather evidence for any place-based question.
+        Prefer multiple layers (for example elevation, land cover, surface water)
+        before answering. When emem returns signed facts or receipts, cite the
+        \`fact_cid\` values in your answer so the user can verify the evidence.
+      `,
+      model: 'openai/gpt-5.4',
+      tools: await ememMcpClient.listTools(),
+    })
+    ```
+
+    :::tip
+    Any AI SDK-compatible model works. Replace `'openai/gpt-5.4'` with another provider string if needed.
+    :::
+  </StepItem>
+
+  <StepItem>
+    Register the agent in `src/mastra/index.ts`:
+
+    ```ts title="src/mastra/index.ts"
+    import { Mastra } from '@mastra/core'
+    import { PinoLogger } from '@mastra/loggers'
+    import { LibSQLStore } from '@mastra/libsql'
+    import { ememAgent } from './agents/emem-agent'
+
+    export const mastra = new Mastra({
+      agents: { ememAgent },
+      storage: new LibSQLStore({ url: ':memory:' }),
+      logger: new PinoLogger({ name: 'Mastra', level: 'info' }),
+    })
+    ```
+  </StepItem>
+</Steps>
+
+## Ask a verification question
+
+Run the agent locally with a place-based question. The agent picks the relevant emem tools, calls them, and answers with citations.
+
+```ts title="src/run-emem-agent.ts"
+import { mastra } from './mastra'
+
+async function main() {
+  const agent = mastra.getAgent('ememAgent')
+
+  const response = await agent.generate(
+    'Using emem, check whether Helsinki Airport, Finland (60.3172, 24.9633) appears to be low-lying or flood-prone. Cite signed facts or receipts when available.',
+  )
+
+  console.log(response.text)
+}
+
+main().catch(error => {
+  console.error(error)
+  process.exit(1)
+})
+```
+
+Run it:
+
+```bash
+npx tsx src/run-emem-agent.ts
+```
+
+The agent reads elevation, land cover, and surface-water layers, then answers with the matching `fact_cid` receipts. Each receipt can be independently audited against the emem registry.
+
+For the upstream reference implementation, see the [emem Mastra example](https://github.com/Vortx-AI/emem/tree/main/examples/mastra).

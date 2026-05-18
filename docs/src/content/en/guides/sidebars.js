@@ -216,6 +216,11 @@ const sidebars = {
               id: 'guide/notes-mcp-server',
               label: 'MCP Server: Notes MCP Server',
             },
+            {
+              type: 'doc',
+              id: 'guide/emem-geospatial-mcp',
+              label: 'MCP Client: emem Geospatial',
+            },
           ],
         },
         {
